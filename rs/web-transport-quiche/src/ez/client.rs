@@ -9,6 +9,15 @@ use crate::ez::DriverState;
 
 use super::{Connection, ConnectionError, DefaultMetrics, Driver, Lock, Metrics, Settings};
 
+// Local buffer between the application and the driver task — *not* the QUIC
+// datagram queue (configured via `Settings::dgram_send_max_queue_len`). It
+// only absorbs scheduling latency between `send_datagram()` and the driver
+// picking the buffer up, so a small fixed size is sufficient. Anything past
+// this is dropped at the channel boundary, which is consistent with the
+// unreliable QUIC datagram contract and avoids hiding drops from quiche's
+// own (configurable) queue.
+pub(super) const DGRAM_CHANNEL_CAPACITY: usize = 64;
+
 /// Construct a QUIC client using sane defaults.
 pub struct ClientBuilder<M: Metrics = DefaultMetrics> {
     settings: Settings,
@@ -161,15 +170,33 @@ impl<M: Metrics> ClientBuilder<M> {
 
         let accept_bi = flume::unbounded();
         let accept_uni = flume::unbounded();
+        let dgram_in = flume::bounded(DGRAM_CHANNEL_CAPACITY);
+        let dgram_out = flume::bounded(DGRAM_CHANNEL_CAPACITY);
+        let dgram_max = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let driver = Lock::new(DriverState::new(false));
-        let app = Driver::new(driver.clone(), accept_bi.0, accept_uni.0);
+        let app = Driver::new(
+            driver.clone(),
+            accept_bi.0,
+            accept_uni.0,
+            dgram_in.0,
+            dgram_out.1,
+            dgram_max.clone(),
+        );
 
         let conn = tokio_quiche::quic::connect_with_config(socket, Some(host), &params, app)
             .await
             .map_err(|e| io::Error::other(e.to_string()))?;
 
-        let conn = Connection::new(conn, driver.clone(), accept_bi.1, accept_uni.1);
+        let conn = Connection::new(
+            conn,
+            driver.clone(),
+            accept_bi.1,
+            accept_uni.1,
+            dgram_in.1,
+            dgram_out.0,
+            dgram_max,
+        );
         Ok(Connecting {
             connection: conn,
             driver,

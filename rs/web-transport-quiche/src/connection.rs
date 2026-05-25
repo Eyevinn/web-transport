@@ -1,10 +1,12 @@
 use crate::{ez, h3, ClientError, RecvStream, SendStream, SessionError};
 
+use bytes::{Bytes, BytesMut};
 use futures::{ready, stream::FuturesUnordered, Stream, StreamExt};
 use web_transport_proto::{ConnectRequest, ConnectResponse, Frame, StreamUni, VarInt};
 
 use std::{
     future::{poll_fn, Future},
+    io::Cursor,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -219,7 +221,6 @@ impl Connection {
         Ok((SendStream::new(send), RecvStream::new(recv)))
     }
 
-    /*
     /// Asynchronously receives an application datagram from the remote peer.
     ///
     /// This method is used to receive an application datagram sent by the remote
@@ -238,7 +239,7 @@ impl Connection {
             // We have to check and strip the session ID from the datagram.
             let actual_id = VarInt::decode(&mut cursor).map_err(|_| SessionError::Unknown)?;
             if actual_id != session_id {
-                return Err(SessionError::Unknown.into());
+                return Err(SessionError::Unknown);
             }
         }
 
@@ -272,14 +273,16 @@ impl Connection {
 
     /// Computes the maximum size of datagrams that may be passed to
     /// [`send_datagram`](Self::send_datagram).
+    ///
+    /// Returns `0` when the peer did not negotiate the QUIC datagram extension
+    /// (or the value is otherwise unavailable) — in that case
+    /// [`send_datagram`](Self::send_datagram) will drop everything.
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
-        mtu.saturating_sub(self.header_datagram.len())
+        match self.conn.max_datagram_size() {
+            Some(mtu) => mtu.saturating_sub(self.header_datagram.len()),
+            None => 0,
+        }
     }
-    */
 
     /// Immediately close the connection with an error code and reason.
     ///
@@ -355,16 +358,16 @@ impl web_transport_trait::Session for Connection {
         self.open_uni().await
     }
 
-    fn send_datagram(&self, _payload: bytes::Bytes) -> Result<(), Self::Error> {
-        todo!()
+    fn send_datagram(&self, payload: bytes::Bytes) -> Result<(), Self::Error> {
+        self.send_datagram(payload)
     }
 
     async fn recv_datagram(&self) -> Result<bytes::Bytes, SessionError> {
-        todo!()
+        self.read_datagram().await
     }
 
     fn max_datagram_size(&self) -> usize {
-        todo!()
+        self.max_datagram_size()
     }
 
     fn protocol(&self) -> Option<&str> {

@@ -1,11 +1,17 @@
+use bytes::Bytes;
 use std::{
     collections::{hash_map, HashMap, HashSet},
     future::poll_fn,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Poll, Waker},
 };
 use tokio_quiche::{
     buf_factory::BufFactory,
     quic::{HandshakeInfo, QuicheConnection},
+    quiche,
 };
 
 use crate::ez::Lock;
@@ -123,6 +129,12 @@ impl DriverState {
         std::mem::take(&mut self.handshake_wakers)
     }
 
+    /// Take the driver's waker, if any. The caller is responsible for waking it.
+    #[must_use = "wake the driver"]
+    pub fn wake(&mut self) -> Option<Waker> {
+        self.waker.take()
+    }
+
     #[must_use = "wake the driver"]
     pub fn send(&mut self, stream_id: StreamId) -> Option<Waker> {
         if !self.send.insert(stream_id) {
@@ -199,6 +211,13 @@ pub(super) struct Driver {
 
     accept_bi: flume::Sender<(SendStream, RecvStream)>,
     accept_uni: flume::Sender<RecvStream>,
+
+    // Datagrams.
+    dgram_in: flume::Sender<Bytes>,
+    dgram_out: flume::Receiver<Bytes>,
+    // Writable datagram size in bytes, published once at handshake. 0 means the
+    // peer didn't negotiate the datagram extension.
+    dgram_max: Arc<AtomicUsize>,
 }
 
 impl Driver {
@@ -206,6 +225,9 @@ impl Driver {
         state: Lock<DriverState>,
         accept_bi: flume::Sender<(SendStream, RecvStream)>,
         accept_uni: flume::Sender<RecvStream>,
+        dgram_in: flume::Sender<Bytes>,
+        dgram_out: flume::Receiver<Bytes>,
+        dgram_max: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             state,
@@ -214,6 +236,9 @@ impl Driver {
             buf: vec![0u8; BufFactory::MAX_BUF_SIZE],
             accept_bi,
             accept_uni,
+            dgram_in,
+            dgram_out,
+            dgram_max,
         }
     }
 
@@ -224,6 +249,14 @@ impl Driver {
     ) -> Result<(), ConnectionError> {
         // Capture the negotiated ALPN protocol.
         let alpn = qconn.application_proto();
+
+        // Publish the writable MTU once the handshake completes. The negotiated
+        // value is fixed for the lifetime of the connection.
+        self.dgram_max.store(
+            qconn.dgram_max_writable_len().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+
         let wakers = {
             let mut state = self.state.lock();
             state.alpn = (!alpn.is_empty()).then(|| alpn.to_vec());
@@ -400,12 +433,20 @@ impl Driver {
 
         let (sleep, send, recv, bi_wakers, uni_wakers) = {
             let mut driver = self.state.lock();
+            // Park the waker before checking for work. `send_datagram` pushes
+            // to the channel first, then takes this waker — observing the
+            // queue after we publish the waker means any racing producer is
+            // guaranteed to either (a) see our waker and wake us, or (b) have
+            // already enqueued an item we will see here.
             driver.waker = Some(waker.clone());
+
+            let dgram_work = !self.dgram_out.is_empty();
 
             let sleep = driver.bi.create.is_empty()
                 && driver.uni.create.is_empty()
                 && driver.send.is_empty()
-                && driver.recv.is_empty();
+                && driver.recv.is_empty()
+                && !dgram_work;
 
             for (id, (send, recv)) in driver.bi.create.drain(..) {
                 qconn.stream_send(id.into(), &[], false)?;
@@ -554,6 +595,33 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     fn process_reads(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         if let Err(e) = self.read(qconn) {
             self.abort(e);
+            return Ok(());
+        }
+
+        // Drain any incoming datagrams into the application-side flume channel.
+        // The channel is bounded — if the application can't keep up we drop
+        // the new datagram (consistent with the unreliable contract).
+        loop {
+            match qconn.dgram_recv(&mut self.buf) {
+                Ok(len) => {
+                    let buf = Bytes::copy_from_slice(&self.buf[..len]);
+                    match self.dgram_in.try_send(buf) {
+                        Ok(()) => {}
+                        Err(flume::TrySendError::Full(_)) => {
+                            tracing::trace!("dropping incoming datagram: channel full");
+                        }
+                        Err(flume::TrySendError::Disconnected(_)) => {
+                            // Receiver dropped — connection gone or not interested.
+                            break;
+                        }
+                    }
+                }
+                Err(quiche::Error::Done) => break,
+                Err(err) => {
+                    tracing::trace!(?err, "ignoring datagram recv error");
+                    break;
+                }
+            }
         }
 
         Ok(())
@@ -562,6 +630,19 @@ impl tokio_quiche::ApplicationOverQuic for Driver {
     fn process_writes(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
         if let Err(e) = self.write(qconn) {
             self.abort(e);
+            return Ok(());
+        }
+
+        // Datagrams are unreliable by spec — on any send failure (queue full,
+        // too large, peer didn't negotiate, etc.) we drop the datagram rather
+        // than buffer it and risk leaking memory under backpressure.
+        while let Ok(buf) = self.dgram_out.try_recv() {
+            match qconn.dgram_send(&buf) {
+                Ok(()) => {}
+                Err(err) => {
+                    tracing::trace!(?err, len = buf.len(), "dropping outbound datagram");
+                }
+            }
         }
 
         Ok(())
