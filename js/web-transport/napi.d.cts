@@ -87,14 +87,14 @@ export declare class NapiSession {
 	closed(): Promise<NapiCloseInfo>;
 }
 
-/** Options for connecting to a WebTransport server. */
-export interface NapiConnectOptions {
-	/** Subprotocols for WT-Available-Protocols negotiation. */
-	protocols?: Array<string> | undefined | null;
-}
-
 /** Info about why a session was closed, matching W3C WebTransportCloseInfo. */
 export interface NapiCloseInfo {
 	closeCode: number;
 	reason: string;
+}
+
+/** Options for connecting to a WebTransport server. */
+export interface NapiConnectOptions {
+	/** Subprotocols for WT-Available-Protocols negotiation. */
+	protocols?: Array<string>;
 }
